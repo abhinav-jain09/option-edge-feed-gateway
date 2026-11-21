@@ -24,6 +24,16 @@ import org.junit.jupiter.api.Test;
  */
 class C150MirrorTest {
 
+    // the sentences BoardHold publishes, copied from processing c5ac31c5 BoardHold.java: the record
+    // carries these, never the constants' names
+    static final String HOLD_ROUND = "waiting for a full round of the board: the strike set reset "
+            + "and no strike has repeated yet, so what is held is a fragment and not a board";
+    static final String HOLD_QUIET = "no record has arrived on the gamma strike topic since the "
+            + "last published board: the input is quiet and these figures are the previous board's";
+    static final String HOLD_REFUSED = "records arrived on the gamma strike topic and this service "
+            + "admitted none of them: these figures are the previous board's and the input is not "
+            + "being read";
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /** 2026-11-20 16:00:08 ET, the cycle the map service valued its last board at. */
@@ -420,7 +430,7 @@ class C150MirrorTest {
 
     private static final String C150 = "{\"symbol\":\"SPX\",\"expiry\":\"20261120\",\"spot\":6963.7,"
             + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
-            + "\"boardHold\":{\"heldFromCycleMs\":1,\"ageMs\":542000,\"reason\":\"INPUT_QUIET\",\"strikesSoFar\":6},"
+            + "\"boardHold\":{\"heldFromCycleMs\":1,\"ageMs\":542000,\"reason\":\"" + HOLD_QUIET + "\",\"strikesSoFar\":6},"
             + "\"strikes\":[{\"strikeCents\":700000,\"board\":{\"netGex\":-2.39e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":0.84}},"
             + "{\"strikeCents\":690000,\"board\":{\"netGex\":-2.85e9,\"holdOrAccelerate\":\"ACCELERATE\",\"strength\":1.0}},"
             + "{\"strikeCents\":720000,\"board\":{\"netGex\":9e9,\"strength\":1.4}}],"
@@ -537,7 +547,7 @@ class C150MirrorTest {
 
     private static final String C159 = "{\"symbol\":\"SPX\",\"expiry\":\"20261120\",\"spot\":6963.7,"
             + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
-            + "\"boardHold\":{\"ageMs\":62000,\"reason\":\"ROUND_NOT_COMPLETE\",\"strikesSoFar\":43},"
+            + "\"boardHold\":{\"ageMs\":62000,\"reason\":\"" + HOLD_ROUND + "\",\"strikesSoFar\":43},"
             + "\"strikes\":["
             + strike(715000, 1e8, "HOLD", 0.03) + ',' + strike(710000, 1e8, "HOLD", 0.03) + ','
             + strike(707500, 1e8, "HOLD", 0.03) + ',' + strike(705000, -3.1e8, "ACCELERATE", 0.13) + ','
@@ -590,5 +600,19 @@ class C150MirrorTest {
     void cycleIsDateAndTimeInNewYork() {
         assertEquals("2026-11-20 15:01:58 New York", WhatIfMirror.hms(1795204918171L));
         assertEquals("2026-11-20 22:00:00 New York", WhatIfMirror.hms(1795230000000L));
+    }
+
+    @Test
+    @DisplayName("C-116, found 2026-11-21: the hold words are keyed by the sentences the service publishes")
+    void holdReasonsAreThePublishedSentences() throws Exception {
+        com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertEquals("held because every gamma record was refused",
+                WhatIfMirror.fmtHold(m.readTree("{\"reason\":\"" + HOLD_REFUSED + "\"}")));
+        assertEquals("held because the gamma round is still filling (43 strikes so far)",
+                WhatIfMirror.fmtHold(m.readTree("{\"reason\":\"" + HOLD_ROUND + "\",\"strikesSoFar\":43}")));
+        // the constant's NAME is not on the wire, so it maps to nothing and prints as it came
+        assertEquals("held because INPUT_QUIET",
+                WhatIfMirror.fmtHold(m.readTree("{\"reason\":\"INPUT_QUIET\"}")));
+        assertEquals(3, WhatIfMirror.HOLD_REASON_WORDS.size());
     }
 }

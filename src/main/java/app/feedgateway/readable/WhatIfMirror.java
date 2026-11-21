@@ -65,7 +65,7 @@ public final class WhatIfMirror {
     public static final String ASSET = "what-if.js";
 
     /** The web commit the asset was read from. */
-    public static final String ASSET_COMMIT = "783642ad";
+    public static final String ASSET_COMMIT = "6bcf80d1";
 
     /**
      * The screen's own staleness bound, transcribed from the asset: {@code STALE_AFTER_MS = 150000}.
@@ -284,15 +284,28 @@ public final class WhatIfMirror {
         return p.isObject() ? number(p, "strike") : null;
     }
 
-    /** {@code fmtHold()}: why the board is held, said once beside the HELD chip. */
+    /**
+     * The asset's {@code HOLD_REASON_WORDS}: C-116's three reasons keyed by the EXACT sentence the
+     * map service publishes in {@code BoardHold.reason} (processing c5ac31c5) -- the record carries
+     * the sentence, never the constant's name, so the earlier switch on the names matched nothing
+     * on the wire (found 2026-11-21).
+     */
+    static final java.util.Map<String, String> HOLD_REASON_WORDS = java.util.Map.of(
+            "waiting for a full round of the board: the strike set reset and no strike has "
+                    + "repeated yet, so what is held is a fragment and not a board",
+            "the gamma round is still filling",
+            "no record has arrived on the gamma strike topic since the last published board: "
+                    + "the input is quiet and these figures are the previous board's",
+            "no gamma record arrived",
+            "records arrived on the gamma strike topic and this service admitted none of them: "
+                    + "these figures are the previous board's and the input is not being read",
+            "every gamma record was refused");
+
+    /** {@code fmtHold()}: why the board is held, said once, on the summary line. */
     static String fmtHold(JsonNode h) {
         String reason = text(h, "reason");
-        String why = switch (reason) {
-            case "INPUT_QUIET" -> "no gamma record arrived";
-            case "ROWS_REFUSED" -> "every gamma record was refused";
-            case "ROUND_NOT_COMPLETE" -> "the gamma round is still filling";
-            default -> reason.isEmpty() ? "reason not published" : reason;
-        };
+        String why = HOLD_REASON_WORDS.getOrDefault(reason,
+                reason.isEmpty() ? "reason not published" : reason);
         Double sofar = number(h, "strikesSoFar");
         return "held because " + why + (sofar == null ? "" : " (" + fixed(sofar, 0) + " strikes so far)");
     }
