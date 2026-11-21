@@ -65,7 +65,7 @@ public final class WhatIfMirror {
     public static final String ASSET = "what-if.js";
 
     /** The web commit the asset was read from. */
-    public static final String ASSET_COMMIT = "6bcf80d1";
+    public static final String ASSET_COMMIT = "e414aa49";
 
     /**
      * The screen's own staleness bound, transcribed from the asset: {@code STALE_AFTER_MS = 150000}.
