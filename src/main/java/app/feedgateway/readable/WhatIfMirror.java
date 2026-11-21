@@ -65,7 +65,7 @@ public final class WhatIfMirror {
     public static final String ASSET = "what-if.js";
 
     /** The web commit the asset was read from. */
-    public static final String ASSET_COMMIT = "bd0d6b1f";
+    public static final String ASSET_COMMIT = "783642ad";
 
     /**
      * The screen's own staleness bound, transcribed from the asset: {@code STALE_AFTER_MS = 150000}.
@@ -187,15 +187,7 @@ public final class WhatIfMirror {
         String[] fresh = freshness(root, nowMs);
         out.append("|state=").append(fresh[0]).append("|age=").append(fresh[1]);
         out.append('\n');
-        JsonNode hold = root.path("boardHold");
-        if (hold.isObject()) {
-            out.append("status|").append(fmtHold(hold)).append('\n');
-        }
-        Double biggest = biggestStrike(root.path("strikes"), spot);
-        if (biggest != null) {
-            out.append("status|Biggest strike within 100 points: ").append(fixed(biggest, 0))
-                    .append('\n');
-        }
+        // C-170: each thing once. The hold's reason and the biggest strike are on the summary line.
     }
 
     /**
@@ -280,7 +272,7 @@ public final class WhatIfMirror {
                 parts.add(key[2] + ("DOWN".equals(o) ? " below " : " above ") + st);
             }
         }
-        parts.add("no line: signal layer not built");
+        // C-170: no `no line` clause; the line slot directly under the summary says it
         return String.join(" · ", parts);
     }
 
@@ -474,8 +466,17 @@ public final class WhatIfMirror {
                 continue;
             }
             String word = text((JsonNode) side[2], "dealerAction");
-            out.append("pivot|").append(name).append("|arrow spot to ").append(fixed(k, 0))
-                    .append(" in ").append(word.isEmpty() ? "no published word" : word);
+            // C-171: a pivot on the FAR side of spot draws its arrow to its own job-done line,
+            // labelled with the pivot (a departure from Source §19.3 rule 4, put to the owner)
+            boolean far = "UP".equals(side[1]) ? k < spot : k > spot;
+            if (far && done != null) {
+                out.append("pivot|").append(name).append("|arrow spot to ").append(fixed(done, 0))
+                        .append(" (pivot ").append(fixed(k, 0)).append(" is on the other side of spot)")
+                        .append(" in ").append(word.isEmpty() ? "no published word" : word);
+            } else {
+                out.append("pivot|").append(name).append("|arrow spot to ").append(fixed(k, 0))
+                        .append(" in ").append(word.isEmpty() ? "no published word" : word);
+            }
             if (done != null) {
                 out.append("|help zone ").append(fixed(spot, 2)).append(" to ").append(fixed(done, 0))
                         .append("|job done ").append(fixed(done, 0)).append(" solid black")
@@ -536,21 +537,27 @@ public final class WhatIfMirror {
                 continue;
             }
             String side = "DOWN".equals(orientation) ? "Ladder below" : "Ladder above";
+            // C-174: the card's FACE -- state, rungs, expected bottom, target, phrase
             out.append("unwind|").append(side)
                     .append("|state=").append(blank(text(b, "ladderState")))
                     .append("|rungs=").append(rungs(b))
-                    .append("|span=").append(span(b))
-                    .append('\n');
-            out.append("unwind|").append(side)
                     .append("|expected bottom=").append(bottom(b.path("expectedBottom")))
                     .append("|unwind target=").append(target(b.path("unwindTarget")))
+                    .append('\n');
+            phrase(out, "unwind|" + side, b);
+            // ... and what is behind its tap, each figure with its label and unit
+            JsonNode eb = b.path("expectedBottom");
+            Double absGamma = eb.isObject() ? number(eb, "absGamma") : null;
+            out.append("unwind|").append(side).append("|behind the tap")
+                    .append("|span=").append(span(b))
+                    .append("|gamma at the expected bottom=").append(absGamma == null ? "-"
+                            : fmtGamma(absGamma) + " ($ per 1% move, absolute)")
                     .append("|unwind bias=").append(bias(b.path("unwindBias")))
                     .append("|touch/fail/reclaim=").append(yesNo(b, "touch"))
                     .append(" / ").append(yesNo(b, "fail"))
                     .append(" / ").append(yesNo(b, "reclaim"))
                     .append('\n');
-            reads(out, side, b.path("radarReads"));
-            phrase(out, "unwind|" + side, b);
+            reads(out, side + "|behind the tap", b.path("radarReads"));
         }
     }
 
@@ -650,8 +657,8 @@ public final class WhatIfMirror {
             return "none in reach";
         }
         String by = text(n, "reachableBy");
-        return fixed(strike, 0) + " · " + fmtGamma(number(n, "absGamma")) + " · "
-                + ("BAND".equals(by) ? "by band" : "by session print");
+        // C-174: no figure on the face; the bottom's gamma is behind the tap with its unit
+        return fixed(strike, 0) + " · " + ("BAND".equals(by) ? "by band" : "by session print");
     }
 
     private static String target(JsonNode n) {
@@ -672,7 +679,8 @@ public final class WhatIfMirror {
         if (label.isEmpty() && value == null) {
             return "-";
         }
-        return (label.isEmpty() ? "-" : label) + " · " + fmtGamma(value);
+        return (label.isEmpty() ? "-" : label) + " · " + fmtGamma(value)
+                + (value == null ? "" : " ($ per 1% move, below minus above)");
     }
 
     private static void reads(StringBuilder out, String side, JsonNode r) {
@@ -1061,9 +1069,10 @@ public final class WhatIfMirror {
         return String.format(Locale.ROOT, "%." + places + "f", v);
     }
 
-    private static String hms(long epochMs) {
-        return java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")
+    /** C-175, the asset's {@code fmtCycle()}: date and time in New York, the zone named. */
+    static String hms(long epochMs) {
+        return java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT)
                 .withZone(ReadablePage.NY)
-                .format(java.time.Instant.ofEpochMilli(epochMs));
+                .format(java.time.Instant.ofEpochMilli(epochMs)) + " New York";
     }
 }

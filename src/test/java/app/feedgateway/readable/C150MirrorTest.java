@@ -155,9 +155,12 @@ class C150MirrorTest {
 
         assertTrue(page.contains("unwind|panel=Ladder unwind|blocks=1"), page);
         assertTrue(page.contains("unwind|Ladder below|state=ARMED|rungs=3 (2 below, 1 above)"), page);
-        assertTrue(page.contains("|expected bottom=6950 · +8.0M · by band"), page);
+        // re-aimed for C-174: the face carries the bottom's strike; its gamma is behind the tap
+        assertTrue(page.contains("|expected bottom=6950 · by band|unwind target=7025"), page);
+        assertTrue(page.contains("|behind the tap|span="), page);
+        assertTrue(page.contains("|gamma at the expected bottom=+8.0M ($ per 1% move, absolute)"), page);
         assertTrue(page.contains("|unwind target=7025 · stopped by the band"), page);
-        assertTrue(page.contains("|unwind bias=BUY · +4.0M"), page);
+        assertTrue(page.contains("|unwind bias=BUY · +4.0M ($ per 1% move, below minus above)"), page);
         assertTrue(page.contains("|touch/fail/reclaim=yes / no / no"), page);
         assertTrue(page.contains("reads=absorbed ON, buyer off, off-peak ON, thin below off"
                 + "|strength=2|armed by=sellers_absorbed, trading_off_peak"), page);
@@ -431,7 +434,9 @@ class C150MirrorTest {
     void heldBoardIsNeverLive() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS + 5000, C150);
         assertTrue(page.contains("|state=HELD|age=board 542s old"), page);
-        assertTrue(page.contains("status|held because no gamma record arrived (6 strikes so far)"), page);
+        // C-170: the reason is on the summary line, once
+        assertTrue(page.contains("summary|SPX 6963.70 · board HELD 542s old: no gamma record arrived, 6 strikes so far"), page);
+        assertFalse(page.contains("status|held because"), page);
         assertTrue(!page.contains("state=LIVE"), page);
     }
 
@@ -440,7 +445,9 @@ class C150MirrorTest {
     void biggestStrikeWithinOneHundredPoints() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
         // 7200 carries 1.4 but is 236 points out; 6900 is the top of the scale inside the window
-        assertTrue(page.contains("status|Biggest strike within 100 points: 6900"), page);
+        // C-170: said once, on the summary line
+        assertTrue(page.contains("· biggest strike within 100 points 6900, ACCELERATE ·"), page);
+        assertFalse(page.contains("status|Biggest"), page);
     }
 
     @Test
@@ -493,8 +500,7 @@ class C150MirrorTest {
         String page = WhatIfMirror.renderWhole(CYCLE_MS + 5000, C159);
         assertTrue(page.contains("summary|SPX 6963.70 · board HELD 62s old: the gamma round is still "
                 + "filling, 43 strikes so far · biggest strike within 100 points 6900, ACCELERATE · "
-                + "pivot 7000 both sides · ladder below WATCH · stair above WATCH · no line: signal "
-                + "layer not built"), page);
+                + "pivot 7000 both sides · ladder below WATCH · stair above WATCH\n"), page);
         String summary = page.lines().filter(l -> l.startsWith("summary|")).findFirst().orElseThrow();
         assertFalse(summary.matches(".*(BUY|SELL|dealer).*"), summary);
     }
@@ -507,7 +513,8 @@ class C150MirrorTest {
                 "one bar per strike with a published net gamma\n" + page);
         assertTrue(page.contains("pivot|up|arrow spot to 7000 in BUY|help zone 6963.70 to 7082"
                 + "|job done 7082 solid black|dead zone 7082 to 7087.00"), page);
-        assertTrue(page.contains("pivot|down|arrow spot to 7000 in SELL|help zone 6963.70 to 6919"
+        // C-171: the DOWN pivot 7000 sits above spot, so its arrow runs to its own job-done line
+        assertTrue(page.contains("pivot|down|arrow spot to 6919 (pivot 7000 is on the other side of spot) in SELL|help zone 6963.70 to 6919"
                 + "|job done 6919 solid black|dead zone 6919 to 6858.70|hatched: outside force TREND for 4m"),
                 "the force sits over the DOWN help zone only\n" + page);
         // the UP line is exactly this, with NO hatch: the force is DOWN
@@ -565,5 +572,23 @@ class C150MirrorTest {
         assertEquals("bar 84%", WhatIfMirror.strengthBar(0.84));
         assertEquals("bar 100%", WhatIfMirror.strengthBar(1.4));
         assertEquals("no bar", WhatIfMirror.strengthBar(null));
+    }
+
+    // ---- C-171, C-175 ------------------------------------------------------------------------
+
+    @Test
+    @DisplayName("C-171: a pivot on the far side of spot is drawn to its own job-done line, labelled with the pivot")
+    void farSidePivotPointsItsOwnWay() {
+        // the 11-20 case: the DOWN pivot 7000 sits ABOVE spot 6963.70
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C159);
+        assertTrue(page.contains("pivot|down|arrow spot to 6919 (pivot 7000 is on the other side of spot) in SELL"), page);
+        assertTrue(page.contains("pivot|up|arrow spot to 7000 in BUY"), page);
+    }
+
+    @Test
+    @DisplayName("C-175: the cycle is a date and time in New York, the zone named")
+    void cycleIsDateAndTimeInNewYork() {
+        assertEquals("2026-11-20 15:01:58 New York", WhatIfMirror.hms(1795204918171L));
+        assertEquals("2026-11-20 22:00:00 New York", WhatIfMirror.hms(1795230000000L));
     }
 }
