@@ -140,12 +140,18 @@ class C150MirrorTest {
         assertTrue(page.contains("status|symbol=SPX|expiry=20261120|spot=6963.70"), page);
         assertTrue(page.contains("|state=LIVE|age=30s ago"), page);
 
-        assertTrue(page.contains("pivot|panel=Pivot ladder"), page);
-        assertTrue(page.contains(
-                "pivot|Upward pivot|strike=7000|dealer must=SELL|net gamma=+1.2M"
-                        + "|job done at=7010 (+10)"), page);
-        assertTrue(page.contains("pivot|standing still=SELL|outside force=no outside force"
-                + "|reason=the session has not produced two completed 10-minute ranges yet"), page);
+        // re-aimed for C-159 / R-PIV-9: the screen DRAWS the ladder now, so the mirror says what
+        // each drawing rule put on the panel instead of printing the old cards
+        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=yes|axis=6858.70 to 7068.70"
+                + "|spot=6963.70 dashed"), page);
+        assertTrue(page.contains("pivot|up|arrow spot to 7000 in SELL|help zone 6963.70 to 7010"
+                + "|job done 7010 solid black|dead zone 7010 to 7068.70"), page);
+        assertTrue(page.contains("pivot|Upward pivot 7000 · SELL · job done at 7010 (+10)"), page);
+        // C-165: the lean and a NONE force are behind the tap
+        assertTrue(page.contains("pivot|behind the tap|standing-still lean SELL (its two side magnitudes "
+                + "are not published on this block)|outside force none (the session has not produced two "
+                + "completed 10-minute ranges yet)"), page);
+        assertFalse(page.contains("dealer must"), "C-159: the drawn panel replaces the cards\n" + page);
 
         assertTrue(page.contains("unwind|panel=Ladder unwind|blocks=1"), page);
         assertTrue(page.contains("unwind|Ladder below|state=ARMED|rungs=3 (2 below, 1 above)"), page);
@@ -156,9 +162,15 @@ class C150MirrorTest {
         assertTrue(page.contains("reads=absorbed ON, buyer off, off-peak ON, thin below off"
                 + "|strength=2|armed by=sellers_absorbed, trading_off_peak"), page);
 
-        assertTrue(page.contains("table|cols=Strike|Net gamma|Reading|Strength"
-                + "|Decay to close (index delta)|Band (edge prices)|Call delta|Put delta"), page);
-        assertTrue(page.contains("row|7000|+1.2M|HOLD|34%|64.2k up|d05? 6916.00 / d95? 7084.00|-|-"), page);
+        // re-aimed for C-159 item 3: the face carries six columns; decay and band are behind the tap
+        assertTrue(page.contains("table|cols=Strike|Reading|Strength|Net gamma ($ per 1% move)"
+                + "|Call delta|Put delta"), page);
+        assertTrue(page.contains("row|7000|HOLD|bar 34%|+1.2M|-|-"), page);
+        assertTrue(page.contains("tap|7000|call delta not published for this strike"
+                + "|put delta not published for this strike|strength 34% of the largest within 100 points"
+                + "|decay to close 64.2k up (index delta)|band edges d05? 6916.00 / d95? 7084.00"
+                + "|band from the strike -84 / +84 points from the strike"
+                + "|charm, vanna, levels, flips not drawn on this page yet"), page);
     }
 
     @Test
@@ -171,7 +183,7 @@ class C150MirrorTest {
         assertTrue(high >= 0 && spot >= 0 && low >= 0, page);
         assertTrue(high < spot, "the strike above price comes first\n" + page);
         assertTrue(spot < low, "the spot line precedes the strikes below it\n" + page);
-        assertTrue(page.contains("table|rows=2|spot row drawn=yes"), page);
+        assertTrue(page.contains("table|face rows=2|behind show all=0|spot row drawn=yes"), page);
     }
 
     // ---------------------------------------------------------------------------- absences
@@ -203,11 +215,12 @@ class C150MirrorTest {
                         + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
                         + "\"strikes\":[{\"strikeCents\":700000,\"board\":{\"netGex\":1.2e6}}]}");
         // re-aimed: the screen now SAYS an absent panel in words rather than drawing nothing (R-IN-2)
-        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: no strike in reach"), page);
-        assertTrue(page.contains("unwind|panel=Ladder unwind|drawn=no|Ladder unwind: no ladder"), page);
-        assertTrue(page.contains("stair|panel=Staircase|drawn=no|Staircase: no staircase"), page);
+        // re-aimed for C-161: the record carries no reason for an absent block, so none is claimed
+        assertTrue(page.contains("pivot|panel=Pivot ladder|drawn=no|Pivot ladder: not published this cycle."), page);
+        assertTrue(page.contains("unwind|panel=Ladder unwind|drawn=no|Ladder unwind: not published this cycle."), page);
+        assertTrue(page.contains("stair|panel=Staircase|drawn=no|Staircase: not published this cycle."), page);
         // and the row still renders, with each absent cell named
-        assertTrue(page.contains("row|7000|+1.2M|-|-|-|-|-|-"), page);
+        assertTrue(page.contains("row|7000|-|no bar|+1.2M|-|-"), page);
     }
 
     @Test
@@ -225,8 +238,9 @@ class C150MirrorTest {
         String page = WhatIfMirror.renderWhole(CYCLE_MS,
                 "{\"symbol\":\"SPX\",\"pivotLadder\":{\"pivotUp\":{\"strike\":7000,"
                         + "\"dealerAction\":\"SELL\"},\"pivotDown\":null},\"strikes\":[]}");
-        assertTrue(page.contains("pivot|Upward pivot|strike=7000"), page);
-        assertTrue(page.contains("pivot|Downward pivot|none in reach"), page);
+        // no spot on this record, so the cards stand in for the drawing, in C-164's ruled form
+        assertTrue(page.contains("pivot|Upward pivot 7000 · SELL · job done at -"), page);
+        assertTrue(page.contains("pivot|Downward pivot: none in reach"), page);
         assertFalse(page.contains("Downward pivot|strike=0"), "a zero strike reads as a level\n" + page);
     }
 
@@ -268,8 +282,8 @@ class C150MirrorTest {
         String page = WhatIfMirror.renderWhole(CYCLE_MS,
                 "{\"symbol\":\"SPX\",\"strikes\":[{\"board\":{\"netGex\":1.0e6}},"
                         + "{\"strikeCents\":700000,\"board\":{\"netGex\":2.0e6}}]}");
-        assertTrue(page.contains("table|rows=1"), page);
-        assertTrue(page.contains("row|7000|+2.0M"), page);
+        assertTrue(page.contains("table|face rows=1|"), page);
+        assertTrue(page.contains("row|7000|-|no bar|+2.0M"), page);
     }
 
     // ------------------------------------------- the block that names what the screen ignores
@@ -445,15 +459,114 @@ class C150MirrorTest {
         assertTrue(page.contains("stair|Stair above|state=WATCH|rungs=2 (6950 - 7050)|top step=7050"
                 + "|pin target=7000 · pull turns back|steps taken=0"), page);
         assertTrue(page.contains("stair|Stair above|phrase=\"Stair above. First step 7050.\" "
-                + "not spoken (another pattern has the minute)|OPPOSED"), page);
+                + "not spoken|OPPOSED"), page);
+        assertFalse(page.contains("another pattern"), "C-162: the record names no pattern\n" + page);
     }
 
     @Test
-    @DisplayName("R-IN-2: an excluded strike prints its reason; a missing delta prints the producer's reason")
+    @DisplayName("C-160 CONTRACT SHAPE ONLY (no live record carries excluded:true); C-163 a missing delta is a dash, its reason in words behind the tap")
     void exclusionsAndDeltaReasons() {
         String page = WhatIfMirror.renderWhole(CYCLE_MS, C150);
-        assertTrue(page.contains("row|6970|+0.0M|excluded: BAND_NOT_BRACKETED"), page);
-        assertTrue(page.contains("|0.453|PARITY_IV"), page);
+        // C-159: an excluded row carries its reason and NO figure
+        assertTrue(page.contains("row|6970|excluded: BAND_NOT_BRACKETED"), page);
+        assertFalse(page.contains("+0.0M"), page);
+        assertTrue(page.contains("|0.453|-"), page);
+        assertTrue(page.contains("|put delta not published: volatility taken from the other side of the strike|"), page);
+        assertFalse(page.contains("|PARITY_IV"), "C-163: no producer code on the face\n" + page);
         assertTrue(!page.contains("note|Call delta and Put delta are empty"), page);
+    }
+
+    // ---- C-159: the face, the drawn ladder and the summary line (web ee25ec26), mirrored -----
+
+    @Test
+    @DisplayName("the stale bound is the screen's 150 s, so the two never disagree between 90 and 150 s")
+    void staleBoundMatchesTheScreen() {
+        String rec = "{\"symbol\":\"SPX\",\"spot\":6963.7,\"fingerprint\":{\"valuationTime\":"
+                + CYCLE_MS + "},\"strikes\":[]}";
+        assertEquals(150_000L, WhatIfMirror.STALE_AFTER_MS);
+        assertTrue(WhatIfMirror.renderWhole(CYCLE_MS + 120_000L, rec).contains("|state=LIVE|age=2m ago"),
+                "the screen says LIVE at 120 s, and so must this page");
+        assertTrue(WhatIfMirror.renderWhole(CYCLE_MS + 151_000L, rec).contains("|state=STALE|"));
+    }
+
+    @Test
+    @DisplayName("C-159 item 5: the summary line, published words only, no dealer action")
+    void summaryLineMatchesTheScreen() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS + 5000, C159);
+        assertTrue(page.contains("summary|SPX 6963.70 · board HELD 62s old: the gamma round is still "
+                + "filling, 43 strikes so far · biggest strike within 100 points 6900, ACCELERATE · "
+                + "pivot 7000 both sides · ladder below WATCH · stair above WATCH · no line: signal "
+                + "layer not built"), page);
+        String summary = page.lines().filter(l -> l.startsWith("summary|")).findFirst().orElseThrow();
+        assertFalse(summary.matches(".*(BUY|SELL|dealer).*"), summary);
+    }
+
+    @Test
+    @DisplayName("R-PIV-9: the drawn ladder as text, rule by rule, with the force on its own side")
+    void drawnLadderSaysEachRule() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C159);
+        assertTrue(page.contains("pivot|bars=7075 green · 7050 red · 7000 red · 6975 red · 6950 green · 6900 red (longest) · 6875 green"),
+                "the excluded 6970 is not a bar\n" + page);
+        assertTrue(page.contains("pivot|up|arrow spot to 7000 in BUY|help zone 6963.70 to 7082"
+                + "|job done 7082 solid black|dead zone 7082 to 7087.00"), page);
+        assertTrue(page.contains("pivot|down|arrow spot to 7000 in SELL|help zone 6963.70 to 6919"
+                + "|job done 6919 solid black|dead zone 6919 to 6858.70|hatched: outside force TREND for 4m"),
+                "the force sits over the DOWN help zone only\n" + page);
+        // the UP line is exactly this, with NO hatch: the force is DOWN
+        assertTrue(page.lines().anyMatch(l -> l.equals("pivot|up|arrow spot to 7000 in BUY"
+                + "|help zone 6963.70 to 7082|job done 7082 solid black|dead zone 7082 to 7087.00")), page);
+    }
+
+    @Test
+    @DisplayName("C-159 item 4: four strikes each side of spot plus the named ones; the rest after, as show all")
+    void faceWindowAndShowAll() {
+        String page = WhatIfMirror.renderWhole(CYCLE_MS, C159);
+        // 12 strikes: seven at or above spot (6970 is above 6963.70), five below; four nearest each side
+        assertTrue(page.contains("table|face rows=8|behind show all=4|spot row drawn=yes"), page);
+        for (String k : new String[] {"7000", "6975", "6970", "6950", "6900", "6875", "6850"}) {
+            assertTrue(page.contains("row|" + k + "|"), "face row " + k + "\n" + page);
+        }
+        assertTrue(page.contains("showall|7150|"), page);
+        assertFalse(page.contains("row|7150|"), page);
+    }
+
+    private static final String C159 = "{\"symbol\":\"SPX\",\"expiry\":\"20261120\",\"spot\":6963.7,"
+            + "\"fingerprint\":{\"valuationTime\":" + CYCLE_MS + "},"
+            + "\"boardHold\":{\"ageMs\":62000,\"reason\":\"ROUND_NOT_COMPLETE\",\"strikesSoFar\":43},"
+            + "\"strikes\":["
+            + strike(715000, 1e8, "HOLD", 0.03) + ',' + strike(710000, 1e8, "HOLD", 0.03) + ','
+            + strike(707500, 1e8, "HOLD", 0.03) + ',' + strike(705000, -3.1e8, "ACCELERATE", 0.13) + ','
+            + strike(700000, -2.39e9, "ACCELERATE", 0.84) + ',' + strike(697500, -4.937e8, "ACCELERATE", 0.18) + ','
+            + "{\"strikeCents\":697000,\"board\":{\"netGex\":0,\"excluded\":true,\"excludedReason\":\"BAND_NOT_BRACKETED\"}},"
+            + strike(695000, 1.2e8, "HOLD", 0.05) + ',' + strike(690000, -2.85e9, "ACCELERATE", 1.0) + ','
+            + strike(687500, 1e8, "HOLD", 0.03) + ',' + strike(685000, 1e8, "HOLD", 0.03) + ','
+            + strike(682500, 1e8, "HOLD", 0.03) + "],"
+            + "\"pivotLadder\":{\"pivotUp\":{\"strike\":7000,\"jobDoneLevel\":7082,\"dealerAction\":\"BUY\"},"
+            + "\"pivotDown\":{\"strike\":7000,\"jobDoneLevel\":6919,\"dealerAction\":\"SELL\"},"
+            + "\"standingStillLean\":\"SELL\",\"outsideForce\":\"TREND\",\"outsideForceSide\":\"DOWN\","
+            + "\"outsideForceSinceMinutes\":4},"
+            + "\"ladders\":[{\"orientation\":\"DOWN\",\"ladderState\":\"WATCH\"}],"
+            + "\"staircases\":[{\"orientation\":\"UP\",\"stairState\":\"WATCH\"}]}";
+
+    private static String strike(int cents, double gex, String reading, double strength) {
+        return "{\"strikeCents\":" + cents + ",\"board\":{\"netGex\":" + gex + ",\"holdOrAccelerate\":\""
+                + reading + "\",\"strength\":" + strength + "}}";
+    }
+
+    @Test
+    @DisplayName("C-164: no 'dealer must' anywhere on the mirror, drawn or carded")
+    void noDealerMustAnywhere() {
+        for (String rec : new String[] {fullRecord(), C159, "{\"symbol\":\"SPX\",\"pivotLadder\":{\"pivotUp\":"
+                + "{\"strike\":7000,\"dealerAction\":\"SELL\"}},\"strikes\":[]}"}) {
+            assertFalse(WhatIfMirror.renderWhole(CYCLE_MS, rec).contains("dealer must"), rec);
+        }
+    }
+
+    @Test
+    @DisplayName("C-166: the bar is clamped at 100% and a null strength draws no bar")
+    void strengthBarClampsAndNullDrawsNone() {
+        assertEquals("bar 84%", WhatIfMirror.strengthBar(0.84));
+        assertEquals("bar 100%", WhatIfMirror.strengthBar(1.4));
+        assertEquals("no bar", WhatIfMirror.strengthBar(null));
     }
 }
